@@ -1,5 +1,7 @@
-//! Patching of the `initialize` request: workspace root resolution and the
-//! `initializationOptions` edits that hide the other profile's crates.
+//! Patching of rust-analyzer's client config: workspace root resolution and
+//! the edits that hide the other profile's crates. The same config object
+//! arrives twice, as `initializationOptions` and again as the client's answer
+//! to `workspace/configuration`, and both copies must be patched.
 
 use std::env;
 use std::path::PathBuf;
@@ -28,7 +30,7 @@ pub fn root_of(params: &Value) -> Result<PathBuf> {
 
 /// Edit `params.initializationOptions` in place so that this `profile`'s
 /// rust-analyzer only sees its half of the workspace.
-pub fn patch(params: &mut Value, profile: Target, members: &[Member]) -> Result<()> {
+pub fn patch_initialize(params: &mut Value, profile: Target, members: &[Member]) -> Result<()> {
     if params.is_null() {
         *params = json!({});
     }
@@ -44,7 +46,34 @@ pub fn patch(params: &mut Value, profile: Target, members: &[Member]) -> Result<
     let Some(options) = options.as_object_mut() else {
         unreachable!("initializationOptions was just made an object");
     };
+    patch_options(options, profile, members)
+}
 
+/// Edit the client's `workspace/configuration` answer in place.
+///
+/// rust-analyzer asks for the `rust-analyzer` section only, so `result` is a
+/// one element array holding the same object the editor sent as
+/// `initializationOptions`. rust-analyzer keeps its current config when that
+/// element is null or empty, so those are left alone rather than turned into
+/// a config that only contains our keys.
+pub fn patch_configuration(result: &mut Value, profile: Target, members: &[Member]) -> Result<()> {
+    let Some(items) = result.as_array_mut() else {
+        bail!("workspace/configuration result is not an array");
+    };
+    let Some(options) = items.first_mut().and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    if options.is_empty() {
+        return Ok(());
+    }
+    patch_options(options, profile, members)
+}
+
+fn patch_options(
+    options: &mut Map<String, Value>,
+    profile: Target,
+    members: &[Member],
+) -> Result<()> {
     let excluded = members.iter().filter(|m| m.target != profile);
     let exclude = table(options, "files")?
         .entry("exclude")
@@ -114,7 +143,7 @@ mod tests {
     #[test]
     fn native_creates_tables_and_excludes_wasm() -> Result<()> {
         let mut params = Value::Null;
-        patch(&mut params, Target::Native, &members())?;
+        patch_initialize(&mut params, Target::Native, &members())?;
         assert_eq!(
             params,
             json!({
@@ -130,7 +159,7 @@ mod tests {
     #[test]
     fn wasm_excludes_native_and_sets_target() -> Result<()> {
         let mut params = json!({ "initializationOptions": "garbage" });
-        patch(&mut params, Target::Wasm, &members())?;
+        patch_initialize(&mut params, Target::Wasm, &members())?;
         assert_eq!(
             params,
             json!({
@@ -154,7 +183,7 @@ mod tests {
                 "procMacro": { "enable": true },
             }
         });
-        patch(&mut params, Target::Wasm, &members())?;
+        patch_initialize(&mut params, Target::Wasm, &members())?;
         assert_eq!(
             params["initializationOptions"],
             json!({
@@ -172,13 +201,39 @@ mod tests {
         for key in ["files", "check", "cargo"] {
             let mut params = json!({ "initializationOptions": { key: 1 } });
             assert!(
-                patch(&mut params, Target::Wasm, &members()).is_err(),
+                patch_initialize(&mut params, Target::Wasm, &members()).is_err(),
                 "{key}"
             );
         }
         let mut params = json!({ "initializationOptions": { "files": { "exclude": "x" } } });
-        assert!(patch(&mut params, Target::Native, &members()).is_err());
+        assert!(patch_initialize(&mut params, Target::Native, &members()).is_err());
         let mut params = json!([]);
-        assert!(patch(&mut params, Target::Native, &members()).is_err());
+        assert!(patch_initialize(&mut params, Target::Native, &members()).is_err());
+    }
+
+    #[test]
+    fn configuration_answer_is_patched_like_initialize() -> Result<()> {
+        let mut result = json!([{ "check": { "command": "clippy" } }]);
+        patch_configuration(&mut result, Target::Wasm, &members())?;
+        assert_eq!(
+            result,
+            json!([{
+                "files": { "exclude": ["/ws/app"] },
+                "check": { "command": "clippy", "workspace": false },
+                "cargo": { "target": WASM_TRIPLE },
+            }])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_configuration_answer_is_left_alone() -> Result<()> {
+        for result in [json!([null]), json!([{}]), json!([])] {
+            let mut patched = result.clone();
+            patch_configuration(&mut patched, Target::Wasm, &members())?;
+            assert_eq!(patched, result);
+        }
+        assert!(patch_configuration(&mut json!({}), Target::Wasm, &members()).is_err());
+        Ok(())
     }
 }

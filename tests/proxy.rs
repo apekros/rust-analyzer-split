@@ -4,7 +4,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use assert_cmd::cargo::cargo_bin;
-use lsp_server::{Message, Notification, Request, RequestId};
+use lsp_server::{Message, Notification, Request, RequestId, Response};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -148,16 +148,25 @@ fn encode(messages: &[Message]) -> Result<Vec<u8>> {
 }
 
 /// Split the fake rust-analyzer's stdin dump into the parsed first message
-/// and everything after it, byte for byte.
-fn read_dump(path: &Path) -> Result<(Request, Vec<u8>)> {
+/// and every message after it.
+fn read_dump(path: &Path) -> Result<(Request, Vec<Message>)> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut cursor = Cursor::new(bytes);
     let Some(Message::Request(first)) = Message::read(&mut cursor)? else {
         bail!("rust-analyzer did not receive a request first");
     };
     let mut rest = Vec::new();
-    cursor.read_to_end(&mut rest)?;
+    while let Some(message) = Message::read(&mut cursor)? {
+        rest.push(message);
+    }
     Ok((first, rest))
+}
+
+fn to_json(messages: &[Message]) -> Result<Vec<Value>> {
+    messages
+        .iter()
+        .map(|m| serde_json::to_value(m).map_err(Into::into))
+        .collect()
 }
 
 fn exclude_paths(request: &Request) -> Vec<String> {
@@ -174,7 +183,7 @@ fn exclude_paths(request: &Request) -> Vec<String> {
 }
 
 #[test]
-fn native_profile_excludes_wasm_members_and_forwards_verbatim() -> Result<()> {
+fn native_profile_excludes_wasm_members_and_forwards_the_rest() -> Result<()> {
     let fx = Fixture::new()?;
     fx.write_workspace()?;
     fx.install_fake_rust_analyzer("cat > \"$DUMP\"")?;
@@ -183,15 +192,31 @@ fn native_profile_excludes_wasm_members_and_forwards_verbatim() -> Result<()> {
         "files": { "exclude": ["/keep/me"] },
         "check": { "command": "clippy" },
     }));
-    let trailer = b"Content-Length: 2\r\n\r\n{}garbage that is not even LSP";
+    let after = [
+        Message::Notification(Notification {
+            method: "initialized".into(),
+            params: json!({}),
+        }),
+        Message::Request(Request {
+            id: RequestId::from(2),
+            method: "textDocument/hover".into(),
+            params: json!({ "position": { "line": 1, "character": 2 } }),
+        }),
+        // A response to some request that is not workspace/configuration
+        // must not be touched, even though it looks like a config answer.
+        Message::Response(Response::new_ok(
+            RequestId::from(7),
+            json!([{ "check": { "command": "clippy" } }]),
+        )),
+    ];
     let mut input = encode(&[Message::Request(initialize)])?;
-    input.extend_from_slice(trailer);
+    input.extend(encode(&after)?);
 
     fx.command("native")?.write_stdin(input).assert().success();
 
     let (received, rest) = read_dump(&fx.dump())?;
     assert_eq!(received.method, "initialize");
-    assert_eq!(rest, trailer);
+    assert_eq!(to_json(&rest)?, to_json(&after)?);
     let opts = &received.params["initializationOptions"];
     assert_eq!(
         exclude_paths(&received),
@@ -258,6 +283,96 @@ fn wasm_profile_keeps_client_cargo_target() -> Result<()> {
         json!("wasm32-wasip1")
     );
     Ok(())
+}
+
+/// Neovim and Helix send `workspace/didChangeConfiguration` right after
+/// `initialized`, rust-analyzer answers by asking `workspace/configuration`,
+/// and replaces its whole client config with the answer. That answer needs
+/// the same patch as `initializationOptions` or the split is silently undone.
+#[test]
+fn configuration_answer_is_patched_and_server_output_forwarded() -> Result<()> {
+    let fx = Fixture::new()?;
+    fx.write_workspace()?;
+    let configuration = Message::Request(Request {
+        id: RequestId::from("cfg-1".to_string()),
+        method: "workspace/configuration".into(),
+        params: json!({ "items": [{ "section": "rust-analyzer" }] }),
+    });
+    let progress = Message::Notification(Notification {
+        method: "$/progress".into(),
+        params: json!({ "token": "rustAnalyzer/Indexing" }),
+    });
+    // Speak first, then swallow stdin until the editor hangs up.
+    let out = encode(&[configuration.clone(), progress.clone()])?;
+    fx.install_fake_rust_analyzer(&format!(
+        "printf '%s' {} ; cat > \"$DUMP\"",
+        shell_quote(std::str::from_utf8(&out)?)
+    ))?;
+
+    let mut child = fx
+        .std_command("wasm")?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    let mut stdout = std::io::BufReader::new(child.stdout.take().context("no stdout")?);
+
+    stdin.write_all(&encode(&[Message::Request(fx.initialize(json!({})))])?)?;
+    stdin.flush()?;
+
+    // Whatever rust-analyzer says must reach the editor unchanged, in order.
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let Some(message) = Message::read(&mut stdout)? else {
+            bail!("proxy closed stdout after {seen:?}");
+        };
+        seen.push(message);
+    }
+    assert_eq!(to_json(&seen)?, to_json(&[configuration, progress])?);
+
+    let settings = json!({ "check": { "command": "clippy" } });
+    let answers = [
+        Message::Response(Response::new_ok(
+            RequestId::from("cfg-1".to_string()),
+            json!([settings]),
+        )),
+        // Same id as the answered request, but that one is done: rust-analyzer
+        // would have to ask again for this to be a config answer.
+        Message::Response(Response::new_ok(
+            RequestId::from("cfg-1".to_string()),
+            json!([settings]),
+        )),
+    ];
+    stdin.write_all(&encode(&answers)?)?;
+    drop(stdin);
+    assert!(child.wait()?.success());
+
+    let (_, rest) = read_dump(&fx.dump())?;
+    let patched = json!({
+        "check": { "command": "clippy", "workspace": false },
+        "files": { "exclude": [
+            fx.root().join("app").to_string_lossy(),
+            fx.root().join("native-ish").to_string_lossy(),
+        ] },
+        "cargo": { "target": WASM_TRIPLE },
+    });
+    let mut got = to_json(&rest)?;
+    // exclude order follows cargo metadata, which is not stable to assert on.
+    if let Some(list) = got[0]["result"][0]["files"]["exclude"].as_array_mut() {
+        list.sort_by_key(|v| v.as_str().map(str::to_owned));
+    }
+    assert_eq!(
+        got,
+        vec![
+            json!({ "id": "cfg-1", "result": [patched] }),
+            json!({ "id": "cfg-1", "result": [settings] }),
+        ]
+    );
+    Ok(())
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[test]
