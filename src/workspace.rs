@@ -90,7 +90,7 @@ fn classify_from<'a>(
         return target;
     }
     let is_wasm = dependencies.into_iter().any(|(name, platform)| {
-        name == "wasm-bindgen" || platform.is_some_and(|p| platform_is_wasm(&p))
+        name == "wasm-bindgen" || platform.is_some_and(|p| platform_is_wasm_only(&p))
     });
     if is_wasm {
         Target::Wasm
@@ -100,22 +100,28 @@ fn classify_from<'a>(
 }
 
 /// Whether a `[target.<platform>.dependencies]` key applies to the wasm
-/// target. `platform` is either a bare triple or a `cfg(...)` expression.
-fn platform_is_wasm(platform: &str) -> bool {
-    let Some(wasm) = wasm_target() else {
+/// target and not to the native one. `platform` is either a bare triple or a
+/// `cfg(...)` expression. A dependency for both, like one under
+/// `cfg(not(windows))`, says nothing about which the crate is for.
+fn platform_is_wasm_only(platform: &str) -> bool {
+    let Some(wasm) = get_builtin_target_by_triple(WASM_TRIPLE) else {
         return false;
     };
-    match Expression::parse(platform) {
-        Ok(expr) => expr.eval(|pred| match pred {
-            Predicate::Target(tp) => tp.matches(wasm),
-            _ => false,
-        }),
-        Err(_) => platform == WASM_TRIPLE,
-    }
+    let native = get_builtin_target_by_triple(env!("RUST_ANALYZER_SPLIT_HOST"));
+    platform_applies(platform, wasm)
+        && !native.is_some_and(|native| platform_applies(platform, native))
 }
 
-fn wasm_target() -> Option<&'static TargetInfo> {
-    get_builtin_target_by_triple(WASM_TRIPLE)
+/// Whether `platform`, a bare triple or a `cfg(...)` expression, applies to
+/// `target`.
+fn platform_applies(platform: &str, target: &TargetInfo) -> bool {
+    match Expression::parse(platform) {
+        Ok(expr) => expr.eval(|pred| match pred {
+            Predicate::Target(tp) => tp.matches(target),
+            _ => false,
+        }),
+        Err(_) => platform == target.triple.as_str(),
+    }
 }
 
 #[cfg(test)]
@@ -152,22 +158,39 @@ mod tests {
     }
 
     #[test]
-    fn cfg_matching_wasm_is_wasm() {
-        assert!(platform_is_wasm(r#"cfg(target_family = "wasm")"#));
-        assert!(platform_is_wasm(r#"cfg(target_arch = "wasm32")"#));
-        assert!(platform_is_wasm(
-            r#"cfg(any(target_os = "linux", target_arch = "wasm32"))"#
-        ));
-        assert!(platform_is_wasm(
+    fn cfg_matching_only_wasm_is_wasm() {
+        assert!(platform_is_wasm_only(r#"cfg(target_family = "wasm")"#));
+        assert!(platform_is_wasm_only(r#"cfg(target_arch = "wasm32")"#));
+        assert!(platform_is_wasm_only(
             r#"cfg(all(target_arch = "wasm32", not(unix)))"#
         ));
     }
 
     #[test]
+    fn cfg_matching_native_too_is_native() {
+        // Helix's `[target.'cfg(not(windows))'.dependencies]` matched wasm32
+        // and sent helix-term to the wasm server.
+        assert!(!platform_is_wasm_only("cfg(not(windows))"));
+        assert!(!platform_is_wasm_only(&format!(
+            r#"cfg(any(target_arch = "{}", target_arch = "wasm32"))"#,
+            std::env::consts::ARCH
+        )));
+        let deps = [
+            ("libc", Some("cfg(not(windows))".to_string())),
+            ("signal-hook-tokio", Some("cfg(not(windows))".to_string())),
+        ];
+        assert_eq!(classify_from(None, deps), Target::Native);
+    }
+
+    #[test]
     fn negated_wasm_cfg_is_native() {
         // The Python version substring matched "wasm" and got this wrong.
-        assert!(!platform_is_wasm(r#"cfg(not(target_family = "wasm"))"#));
-        assert!(!platform_is_wasm(r#"cfg(not(target_arch = "wasm32"))"#));
+        assert!(!platform_is_wasm_only(
+            r#"cfg(not(target_family = "wasm"))"#
+        ));
+        assert!(!platform_is_wasm_only(
+            r#"cfg(not(target_arch = "wasm32"))"#
+        ));
         let deps = [(
             "libc",
             Some(r#"cfg(not(target_family = "wasm"))"#.to_string()),
@@ -177,8 +200,8 @@ mod tests {
 
     #[test]
     fn bare_triple_matches_exactly() {
-        assert!(platform_is_wasm("wasm32-unknown-unknown"));
-        assert!(!platform_is_wasm("wasm32-wasip1"));
-        assert!(!platform_is_wasm("x86_64-unknown-linux-gnu"));
+        assert!(platform_is_wasm_only("wasm32-unknown-unknown"));
+        assert!(!platform_is_wasm_only("wasm32-wasip1"));
+        assert!(!platform_is_wasm_only("x86_64-unknown-linux-gnu"));
     }
 }
